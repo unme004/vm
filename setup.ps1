@@ -18,7 +18,7 @@ function Merge-KeyFile([string]$Path, [string[]]$NewKeys) {
     [IO.File]::WriteAllLines($Path, [string[]]$all, (New-Object Text.UTF8Encoding $false))
 }
 
-function Set-SshdOption([string[]]$Lines, [string]$Name, [string]$Value) {
+function Set-SshOption([string[]]$Lines, [string]$Name, [string]$Value) {
     $pattern = '^\s*#?\s*' + [regex]::Escape($Name) + '\s+'
     $found = $false
     $out = foreach ($l in $Lines) {
@@ -27,6 +27,18 @@ function Set-SshdOption([string[]]$Lines, [string]$Name, [string]$Value) {
     }
     if (-not $found) { $out = @("$Name $Value") + $out }
     return $out
+}
+
+function Set-SshFirewall {
+    $ruleName = 'OpenSSH-Server-In-TCP'
+    if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+    }
+    Set-NetFirewallRule -Name $ruleName -Enabled True -Profile Any
+    if ($RestrictToLocalSubnet) {
+        Set-NetFirewallRule -Name $ruleName -RemoteAddress LocalSubnet
+    }
 }
 
 Start-Transcript -Path $LogFile -Append | Out-Null
@@ -47,6 +59,19 @@ try {
         return
     }
 
+    Write-Step "Copying key for administrator accounts"
+    $adminKeyFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+    Merge-KeyFile -Path $adminKeyFile -NewKeys $keys
+    icacls.exe $adminKeyFile /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
+
+    Write-Step "Copying key for user $env:USERNAME"
+    $userKeyFile = Join-Path $env:USERPROFILE '.ssh\authorized_keys'
+    Merge-KeyFile -Path $userKeyFile -NewKeys $keys
+    icacls.exe $userKeyFile /inheritance:r /grant "${env:USERNAME}:F" /grant "*S-1-5-18:F" /grant "*S-1-5-32-544:F" | Out-Null
+
+    Write-Step "Configuring firewall"
+    Set-SshFirewall
+
     Write-Step "Checking OpenSSH Server"
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
     if ($cap.State -ne 'Installed') {
@@ -54,30 +79,15 @@ try {
         Add-WindowsCapability -Online -Name $cap.Name | Out-Null
     }
 
+    Write-Step "Re-applying firewall settings"
+    Set-SshFirewall
+
     Write-Step "Enabling and starting sshd"
     Set-Service -Name sshd -StartupType Automatic
     Start-Service sshd
 
-    Write-Step "Configuring firewall"
-    $ruleName = 'OpenSSH-Server-In-TCP'
-    if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
-            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
-    }
-    Set-NetFirewallRule -Name $ruleName -Enabled True -Profile Any
-    if ($RestrictToLocalSubnet) {
-        Set-NetFirewallRule -Name $ruleName -RemoteAddress LocalSubnet
-    }
-
-    Write-Step "Installing key for administrator accounts"
-    $adminKeyFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-    Merge-KeyFile -Path $adminKeyFile -NewKeys $keys
+    Write-Step "Re-applying key file permissions"
     icacls.exe $adminKeyFile /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
-
-    Write-Step "Installing key for user $env:USERNAME"
-    $userKeyFile = Join-Path $env:USERPROFILE '.ssh\authorized_keys'
-    Merge-KeyFile -Path $userKeyFile -NewKeys $keys
-    icacls.exe $userKeyFile /inheritance:r /grant "${env:USERNAME}:F" /grant "*S-1-5-18:F" /grant "*S-1-5-32-544:F" | Out-Null
 
     if ($UsePowerShellAsDefaultShell) {
         Write-Step "Setting PowerShell as default SSH shell"
@@ -92,9 +102,9 @@ try {
     if (Test-Path $cfg) {
         Write-Step "Updating sshd_config"
         $lines = Get-Content $cfg
-        $lines = Set-SshdOption $lines 'PubkeyAuthentication' 'yes'
+        $lines = Set-SshOption $lines 'PubkeyAuthentication' 'yes'
         if ($DisablePasswordAuth) {
-            $lines = Set-SshdOption $lines 'PasswordAuthentication' 'no'
+            $lines = Set-SshOption $lines 'PasswordAuthentication' 'no'
         }
         Set-Content -Path $cfg -Value $lines -Encoding ascii
     }
